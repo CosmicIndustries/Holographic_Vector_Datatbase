@@ -1,4 +1,4 @@
-Solid project. A **holographic vector database** uses Holographic Reduced Representations (HRRs) — distributed encodings where information is spread across every dimension, not localized. Key ops: **bind** (circular convolution), **superpose** (addition), **probe** (correlation). Ideal for associative memory, analogy, and structured knowledge retrieval.
+A **holographic vector database** uses Holographic Reduced Representations (HRRs) — distributed encodings where information is spread across every dimension, not localized. Key ops: **bind** (circular convolution), **superpose** (addition), **probe** (correlation). Ideal for associative memory, analogy, and structured knowledge retrieval.
 
 Building the core library + interactive visual explorer:All 9 demos pass. Now the interactive visual explorer:Now building the interactive visual explorer:Now packaging the library:Here's what was built and verified:
 
