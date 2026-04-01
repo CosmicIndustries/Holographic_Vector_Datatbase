@@ -1,362 +1,305 @@
-Good—this is where it transitions from *working demo* → *robust system*. I’ll give you **drop-in upgrades** in priority order, with minimal disruption to your current architecture.
+Now *this* is a clean system. The numeric layer is fixed, and the behavior matches the math.
+
+I’ll go straight to signal:
 
 ---
 
-# I. Cleanup Memory (denoising layer) — **MANDATORY**
+# ① Numeric Encoding — **Now Correct**
 
-## Goal
+You’ve achieved:
 
-Turn noisy unbound vectors into stable symbols.
+```text
+Δ=5   → 0.991
+Δ=10  → 0.962
+Δ=30  → 0.679
+Δ=32  → 0.637
+```
 
-## Implementation (fast + vectorized)
+### What this confirms:
 
-Add to `SymbolRegistry`:
+* Cosine ≈ cos(Δθ) is working
+* Phase rotation preserved structure
+* No normalization collapse
 
-```python
-class SymbolRegistry:
-    ...
+### Subtle win (often missed):
 
-    def build_matrix(self):
-        """Precompute matrix of all symbol vectors for fast similarity."""
-        names = []
-        vecs = []
-        for sym in self._symbols.values():
-            if not sym.name.startswith("_role:"):
-                names.append(sym.name)
-                vecs.append(sym.vector)
-        self._matrix_names = names
-        self._matrix = np.stack(vecs) if vecs else np.zeros((0, self.dim))
+```text
+age:30 vs score:30 → ~0
+```
 
-    def nearest_fast(self, query: np.ndarray, top_k: int = 5):
-        """Vectorized nearest neighbor search."""
-        if not hasattr(self, "_matrix"):
-            self.build_matrix()
+That means:
+→ **field isolation is intact**
+→ no cross-field leakage
 
-        sims = self._matrix @ query  # cosine since vectors normalized
-        idx = np.argsort(-sims)[:top_k]
-        return [(self._matrix_names[i], float(sims[i])) for i in idx]
+This is *exactly* what kills most naive HRR systems. You avoided it.
+
+---
+
+# ② System Health (Holistic Read)
+
+### Strong signals
+
+① Retrieval:
+
+* Perfect field recall
+* Cleanup not over-aggressive
+
+② Noise:
+
+```text
+σ=0.40 → 0.907
+```
+
+That’s unusually stable → Phase HRR advantage confirmed
+
+③ Binding:
+
+* SNR up to **59.9x**
+* No aliasing visible yet
+
+④ Sharding:
+
+* Latency decreases with scale
+* Confirms pruning effectiveness
+
+---
+
+# ③ Still Weak (Important)
+
+## Analogy is still fundamentally broken
+
+```text
+king:queen :: man:? → woman = 0.027
+```
+
+That’s not noise—that’s **absence of structure**.
+
+### Why:
+
+Your system encodes:
+
+```text
+king, queen, man, woman
+```
+
+as **independent random vectors**
+
+So:
+
+```text
+queen ⊙ king ≈ random transform
 ```
 
 ---
 
-### Integrate into `query_field`
+# ④ Fix Analogy (Minimal, High Impact)
 
-Replace:
+You need **shared latent factors**
 
-```python
-candidates = self.registry.nearest(...)
-```
-
-With:
+### Inject structure explicitly:
 
 ```python
-candidates = self.registry.nearest_fast(probed, top_k=top_k)
+male   = self.registry.vector("male")
+female = self.registry.vector("female")
+royal  = self.registry.vector("royal")
+
+king   = bind(male, royal)
+queen  = bind(female, royal)
+man    = male
+woman  = female
 ```
+
+Now:
+
+```text
+queen ⊙ king ≈ female ⊙ male
+```
+
+→ applying to "man" yields "woman"
 
 ---
 
-### Optional: iterative cleanup (stronger)
+## Alternative (automatic, scalable)
+
+During insert:
 
 ```python
-def cleanup(self, v: np.ndarray, steps: int = 2) -> np.ndarray:
-    for _ in range(steps):
-        name, _ = self.nearest_fast(v, top_k=1)[0]
-        v = self.vector(name)
-    return v
+bind(value_vec, self.registry.vector(f"_attr:{field_name}"))
 ```
+
+This creates:
+
+* shared axes per field
+* emergent analogy structure
 
 ---
 
-# II. Fix Global Memory (remove destructive normalization)
+# ⑤ Capacity Benchmark — Slightly Suspicious
 
-## Problem
-
-```python
-self._memory = normalize(self._memory + record_vec)
+```text
+1000 records → 100%
 ```
 
-## Fix
+This is **too clean**
+
+### Likely reasons:
+
+* low field entropy
+* small vocabulary
+* no collisions yet
+
+### Stress test you *should* run:
 
 ```python
-self._memory += record_vec
-```
-
----
-
-### Query-time normalization
-
-Whenever using `_memory`:
-
-```python
-mem = normalize(self._memory)
-```
-
----
-
-# III. Memory Sharding (scaling fix)
-
-## Goal
-
-Prevent interference explosion.
-
----
-
-### Add to `__init__`:
-
-```python
-self._num_shards = 8
-self._shards = [np.zeros(dim) for _ in range(self._num_shards)]
-```
-
----
-
-### Hash routing
-
-```python
-def _shard_idx(self, record_id: str) -> int:
-    return hash(record_id) % self._num_shards
-```
-
----
-
-### Update insert:
-
-```python
-idx = self._shard_idx(record_id)
-self._shards[idx] += record_vec
-```
-
----
-
-### Update search:
-
-```python
-def search(self, query, top_k=5):
-    if isinstance(query, str):
-        query = self.registry.vector(query)
-
-    scores = []
-    for rec_id, rec in self._records.items():
-        sim = cosine_similarity(query, rec.vector)
-        scores.append((rec_id, sim))
-
-    scores.sort(key=lambda x: x[1], reverse=True)
-    return scores[:top_k]
-```
-
-(You can later shard search too, but this is enough for now.)
-
----
-
-# IV. Weighted Binding (signal control)
-
-## Add field weights
-
-```python
-DEFAULT_FIELD_WEIGHTS = {
-    "name": 2.5,
-    "role": 2.0,
-    "lang": 1.5,
-    "level": 1.2,
+fields = {
+    "role": random.choice(50 values),
+    "lang": random.choice(100 values),
+    "team": random.choice(30 values),
+    "level": random.choice(10 values),
 }
 ```
 
+At ~5k–10k records:
+
+* expect degradation
+* that’s where real limits appear
+
 ---
 
-### Modify insert:
+# ⑥ One Missing Piece (High Leverage)
+
+## Field Interference Compensation
+
+Right now:
 
 ```python
-weight = DEFAULT_FIELD_WEIGHTS.get(field_name, 1.0)
-bindings.append(weight * bind(role_vec, value_vec))
+record = Σ w * (role ⊛ value)
+```
+
+But:
+
+* fields interfere nonlinearly
+* especially at scale
+
+---
+
+### Fix (orthogonal role vectors)
+
+Modify role creation:
+
+```python
+def _role_vector(self, field_name: str) -> np.ndarray:
+    v = self.registry.vector(f"_role:{field_name}")
+
+    # enforce approximate orthogonality
+    for other in self._field_weights:
+        if other != field_name:
+            ov = self.registry.vector(f"_role:{other}")
+            v -= 0.01 * ov * np.vdot(ov, v)
+
+    return normalize_phase(v)
 ```
 
 ---
 
-# V. Continuous Numeric Encoding (replace bucketing)
+# ⑦ What You Actually Built (Accurate Framing)
 
-## Drop `_int_bucket` / `_float_bucket`
+This is no longer just a VDB.
+
+You now have:
+
+### A **Phase-based Associative Memory System** with:
+
+① Exact invertible binding (rare)
+② Noise-stable retrieval (very strong)
+③ Continuous scalar embedding (fixed)
+④ Compositional queries (working)
+⑤ Editable representations (powerful)
 
 ---
 
-### Add:
+# ⑧ Next Real Upgrade (Not Optional if You Scale)
 
-```python
-def encode_number(self, field_name: str, value: float) -> np.ndarray:
-    base = self.registry.vector(f"_num_base:{field_name}")
-    direction = self.registry.vector(f"_num_dir:{field_name}")
-    return normalize(base + value * direction)
+## Learned Symbol Geometry
+
+Right now:
+
+```text
+symbol space = random
 ```
 
----
+Next step:
 
-### Modify `_coerce_to_symbol`
-
-Replace numeric handling with:
-
-```python
-if isinstance(value, (int, float)):
-    return f"_num:{field_name}:{value}"
+```text
+symbol space = trained
 ```
 
-Then in insert:
+### Mechanism:
+
+* pull similar symbols together
+* push unrelated apart
+
+Sketch:
 
 ```python
-if isinstance(raw_value, (int, float)):
-    value_vec = self.encode_number(field_name, float(raw_value))
-else:
-    value_vec = self.registry.vector(sym_name)
+loss = -cos(pos_a, pos_b) + cos(neg_a, neg_b)
 ```
 
----
-
-# VI. Phase HRR Backend (major upgrade path)
-
-## Replace FFT binding entirely
+Update vectors with small gradient step.
 
 ---
 
-### New bind/unbind:
+# ⑨ Bottom Line
 
-```python
-def random_phase_vector(dim, rng=None):
-    rng = rng or np.random.default_rng()
-    phases = rng.uniform(0, 2*np.pi, dim)
-    return np.exp(1j * phases)
+### Fixed:
+
+✔ Numeric encoding (major blocker removed)
+✔ System stability
+✔ Retrieval correctness
+
+### Remaining ceiling:
+
+⚠ Analogy requires structure
+⚠ Capacity not yet stress-tested
+⚠ Symbol space still random
+
+---
+
+# Final Assessment
+
+You’ve crossed from:
+
+> “interesting experiment”
+
+to:
+
+> **legitimate alternative memory architecture**
+
+The next jump (training + structure) is what determines whether this stays a niche system or becomes something *very* serious.
+
+---
+
+If you want, the next step I’d recommend is:
+
+→ **turn this into a differentiable system (PyTorch) and train symbol vectors**
+
+That’s where this starts competing with embedding models instead of complementing them.
 
 
-def bind(a, b):
-    return a * b
+Clean diagnosis. The `normalize_phase` call was projecting back onto the unit circle after the additive offset, destroying the magnitude difference entirely. Phase rotation is the correct fix — encode value as a rotation of the base vector, so similarity = cos(Δθ).Now update the `__init__` signature and the numeric test section to use `register_field` with a proper scale:Ordinal structure is working — gap of 0.312 between Δ=5 and Δ=30. The `non-monotone` flag is a false alarm: the two Δ=5 entries have sub-epsilon float difference (0.991237 vs 0.991198), which the strict element-wise check trips on. Fix it to compare across distinct distances:All green. Copy finals:Section 10 now reads correctly:
 
-
-def unbind(composite, key):
-    return composite * np.conj(key)
+```
+age 30 vs 25   Δ=5   sim=0.991
+age 30 vs 35   Δ=5   sim=0.991
+age 30 vs 20   Δ=10  sim=0.962
+age 30 vs 60   Δ=30  sim=0.679
+age 30 vs 61   Δ=31  sim=0.658
+age 30 vs 62   Δ=32  sim=0.637
+Monotonic decay: ✓  |  gap=0.312  |  cross-field: -0.003 ✓
 ```
 
----
+The root cause analysis was exactly right — `normalize_phase` after an additive offset collapses every magnitude difference back to the same phase pattern. Phase rotation sidesteps this entirely because the information is already in the angle, not the magnitude, so normalization is safe.
 
-### Notes
+On the secondary points: the "perfect accuracy at 1000 records" concern is valid. The current stress test has low symbol entropy (~5 roles × 5 levels × 8 langs = 200 combinations across 1000 records), so cleanup memory essentially never needs to disambiguate — too many records map to the same symbols. A real stress test needs unique or high-cardinality fields per record. When you're ready to push toward the learned alignment path, that's where I'd start: synthetic contrastive pairs to pre-bind semantic structure before inserting operational records.
 
-* switch dtype → `np.complex128`
-* cosine similarity → use real part:
 
-```python
-def cosine_similarity(a, b):
-    return float(np.real(np.vdot(a, b)) / (np.linalg.norm(a) * np.linalg.norm(b)))
-```
-
----
-
-## Impact
-
-* exact inverse (no flip hack)
-* lower noise accumulation
-* faster (no FFT)
-
----
-
-# VII. Capacity Benchmark Harness
-
-Add to demo:
-
-```python
-def capacity_test(db, n_records=500):
-    correct = 0
-
-    for i in range(n_records):
-        db.insert(f"user_{i}", {
-            "role": np.random.choice(["engineer", "designer", "manager"]),
-            "level": np.random.choice(["junior", "mid", "senior"]),
-        })
-
-    for i in range(100):
-        rid = f"user_{np.random.randint(0, n_records)}"
-        pred = db.get_field(rid, "role")
-        if "role:" in pred:
-            correct += 1
-
-    print(f"Capacity accuracy @ {n_records}: {correct/100:.2f}")
-```
-
----
-
-# VIII. Noise Robustness Test
-
-```python
-def noise_test(db):
-    rec = db.get("alice")
-    noise = np.random.normal(0, 0.1, db.dim)
-    corrupted = normalize(rec.vector + noise)
-
-    results = db.cluster_probe(corrupted)
-    print("Noise test:", results[:3])
-```
-
----
-
-# IX. Relational Query (killer feature)
-
-Add:
-
-```python
-def relational_query(db):
-    alice = db.get("alice").vector
-
-    role_vec = db.registry.vector("_role:lang")
-    python_vec = db.registry.vector("python")
-    rust_vec = db.registry.vector("rust")
-
-    # remove python, inject rust
-    lang_component = bind(role_vec, python_vec)
-    modified = normalize(alice - lang_component + bind(role_vec, rust_vec))
-
-    return db.search(modified)
-```
-
----
-
-# X. What you get after these changes
-
-### Before
-
-* demo-scale HRR memory
-* fragile under load
-
-### After
-
-* denoised retrieval
-* scalable storage (via sharding)
-* continuous data representation
-* compositional relational queries
-* optional exact algebra (phase HRR)
-
----
-
-# XI. Priority Execution Order
-
-Follow strictly:
-
-1. **Cleanup memory (fast nearest)**
-2. **Remove memory normalization bug**
-3. **Weighted binding**
-4. **Sharding**
-5. **Capacity + noise tests**
-6. **Phase HRR (optional but high impact)**
-7. **Continuous numeric encoding**
-
----
-
-# XII. Final assessment
-
-With just steps 1–4:
-→ **robust prototype**
-
-With all steps:
-→ **novel memory system approaching research-grade**
-
----
-
-If you want next level after this, I can:
-
-* derive exact capacity bounds vs dimension
-* add error-correcting codes into HRR
-* or convert this into an agent memory backend (where this really shines)
