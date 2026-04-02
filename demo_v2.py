@@ -102,23 +102,53 @@ for rid, sim in results:
 # 4. Analogy: Phase HRR
 # ─────────────────────────────────────────────────────────────────────────────
 
-hr("4. ANALOGY  (Phase HRR: exact algebra)")
+hr("4. ANALOGY  (structured symbols via latent factors)")
 
-reg = db.registry
+schema = db.schema
 
-# Seed pure symbol analogies
-for name in ["king","queen","man","woman","doctor","nurse","teacher","student"]:
-    reg.get_or_create(name)
+# Declare semantic axes
+schema.register_factor("gender", ["male", "female"])
+schema.register_factor("status", ["royal", "common"])
+schema.register_factor("age",    ["adult", "young"])
+schema.register_factor("domain", ["tech", "design", "management"])
+schema.register_factor("skill",  ["python", "rust", "figma", "english"])
 
-print("  Pure symbol analogy: king:queen :: man:?")
-results = db.analogy("king", "queen", "man", top_k=5)
-for name, sim in results:
-    print(f"       {name:<12} sim={sim:.3f}")
+# Define symbols as bindings of their latent factors
+schema.define_symbol("king",    gender="male",   status="royal")
+schema.define_symbol("queen",   gender="female", status="royal")
+schema.define_symbol("man",     gender="male",   status="common")
+schema.define_symbol("woman",   gender="female", status="common")
+schema.define_symbol("prince",  gender="male",   status="royal",  age="young")
+schema.define_symbol("princess",gender="female", status="royal",  age="young")
+schema.define_symbol("boy",     gender="male",   status="common", age="young")
+schema.define_symbol("girl",    gender="female", status="common", age="young")
 
-print("\n  Record analogy: alice:carol :: eve:? (senior-eng relationship)")
-results = db.analogy("alice", "carol", "eve", top_k=5)
-for name, sim in results:
-    print(f"       {name:<12} sim={sim:.3f}")
+print("  Symbols defined from shared latent factors:")
+print("  king  = bind(male, royal)")
+print("  queen = bind(female, royal)")
+print("  man   = bind(male, common)")
+print("  woman = bind(female, common)\n")
+
+analogies = [
+    ("king",  "queen",   "man",   "woman"),
+    ("king",  "prince",  "queen", "princess"),
+    ("man",   "boy",     "woman", "girl"),
+    ("king",  "queen",   "prince","princess"),
+]
+
+print(f"  {'query':<28} {'top hit':<14} {'expected':<14} {'sim':>6}  ok?")
+print(f"  {'-'*65}")
+for a, b, c, expected in analogies:
+    results = db.analogy(a, b, c, top_k=5)
+    # Filter out factor-internal symbols (_f: prefix)
+    results = [(n,s) for n,s in results if not n.startswith("_")]
+    top_name, top_sim = results[0] if results else ("—", 0.0)
+    ok = "✓" if top_name == expected else f"✗ (got {top_name})"
+    print(f"  {a}:{b} :: {c}:?  {'':4}  {top_name:<14} {expected:<14} {top_sim:>6.3f}  {ok}")
+
+print(f"\n  schema.symbols_sharing_factor('gender','female'): "
+      f"{schema.symbols_sharing_factor('gender','female')}")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,6 +208,7 @@ for noise_sigma in [0.05, 0.1, 0.2, 0.4]:
 
 hr("8. BINDING FIDELITY  (Phase HRR — exact algebra)")
 
+reg = db.registry
 pairs = [("sky","blue"), ("fire","hot"), ("ocean","deep"), ("forest","green"),
          ("python","dynamic"), ("rust","fast"), ("haskell","pure"), ("c","unsafe")]
 
@@ -208,47 +239,50 @@ print(f"\n  Result: {'ALL PASS ✓' if all_ok else 'SOME FAIL ✗'}")
 # 9. Capacity benchmark
 # ─────────────────────────────────────────────────────────────────────────────
 
-hr("9. CAPACITY BENCHMARK  (scaling test)")
+hr("9. CAPACITY BENCHMARK  (high-entropy stress test)")
 
-roles  = ["engineer","designer","manager","analyst","researcher"]
-levels = ["junior","mid","senior","staff","principal"]
-langs  = ["python","rust","go","js","cpp","java","kotlin","swift"]
+# Vocabulary large enough to expose real interference limits
+ROLES  = [f"role_{i}"  for i in range(50)]
+LANGS  = [f"lang_{i}"  for i in range(100)]
+TEAMS  = [f"team_{i}"  for i in range(30)]
+LEVELS = [f"level_{i}" for i in range(10)]
 
-print("  Inserting records and measuring field retrieval accuracy...\n")
-print(f"  {'N records':<12} {'accuracy':<12} {'time/query':<14} {'notes'}")
+print("  Vocabulary: 50 roles × 100 langs × 30 teams × 10 levels")
+print("  Fields per record: 4  |  dim=1024  |  shards=16\n")
+print(f"  {'N records':<12} {'accuracy':<12} {'avg query ms':<16} {'status'}")
 print(f"  {'-'*55}")
 
-db2 = HolographicVDB(dim=1024, seed=99, num_shards=16)
-checkpoints = [50, 100, 250, 500, 1000]
+db_stress = HolographicVDB(dim=1024, seed=42, num_shards=16)
 n_inserted = 0
-n_test = 50
+checkpoints = [100, 500, 1000, 2500, 5000, 10000]
+n_test = 100
 
 for target in checkpoints:
-    # Insert up to target
     while n_inserted < target:
-        uid = f"user_{n_inserted}"
-        db2.insert(uid, {
-            "role":  RNG.choice(roles),
-            "level": RNG.choice(levels),
-            "lang":  RNG.choice(langs),
+        uid = f"u{n_inserted}"
+        db_stress.insert(uid, {
+            "role":  RNG.choice(ROLES),
+            "lang":  RNG.choice(LANGS),
+            "team":  RNG.choice(TEAMS),
+            "level": RNG.choice(LEVELS),
         })
         n_inserted += 1
 
-    # Accuracy probe
     correct = 0
     t0 = time.perf_counter()
     for _ in range(n_test):
         idx = int(RNG.integers(0, n_inserted))
-        rid = f"user_{idx}"
-        rec = db2.get(rid)
-        pred = db2.get_field(rid, "role")
+        rid = f"u{idx}"
+        rec = db_stress.get(rid)
+        pred = db_stress.get_field(rid, "role")
         if pred == rec.raw_values["role"]:
             correct += 1
-    elapsed = (time.perf_counter() - t0) / n_test * 1000  # ms/query
+    elapsed_ms = (time.perf_counter() - t0) / n_test * 1000
 
     acc = correct / n_test
-    note = "✓ robust" if acc >= 0.8 else ("~ degrading" if acc >= 0.5 else "✗ collapsed")
-    print(f"  {target:<12} {acc:.0%}{'':6} {elapsed:.2f}ms{'':8} {note}")
+    status = "✓ robust" if acc >= 0.85 else ("~ degrading" if acc >= 0.60 else "✗ collapsed")
+    print(f"  {target:<12} {acc:.0%}{'':6} {elapsed_ms:.2f}ms{'':9} {status}")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

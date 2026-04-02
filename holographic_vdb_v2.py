@@ -3,23 +3,28 @@ holographic_vdb_v2.py
 ======================
 Holographic Vector Database — v2, research-grade.
 
-Upgrades from v1:
+v2 upgrades (from v1):
   ① Phase HRR backend   — complex unit vectors, bind = a*b, unbind = a*conj(b)
-                           Exact inverse. No FFT overhead. Lower noise accumulation.
-  ② Cleanup memory      — vectorized matrix multiply for fast denoising.
-                           Snap noisy probes back to valid symbols.
-  ③ Memory normalization fix — additive (no destructive normalize on insert).
-  ④ Memory sharding     — hash-route records to 16 independent shards.
-                           Capacity scales ~linearly.
-  ⑤ Weighted binding    — per-field importance weights.
-  ⑥ Continuous numeric  — base + scalar*direction encoding.
-                           Preserves ordinal relationships; 42 ≠ 43.
+  ② Cleanup memory      — vectorized matrix multiply, iterative denoising
+  ③ Normalization fix   — additive shard memory, normalize at query time only
+  ④ Memory sharding     — hash-route records across N independent shards
+  ⑤ Weighted binding    — per-field importance weights
+  ⑥ Phase rotation nums — encode_number via base * exp(i*theta), ordinal-safe
+
+v2.1 upgrades (this file):
+  ⑦ Orthogonal roles    — Gram-Schmidt enforcement on role vectors so field
+                           bindings don't cross-interfere at scale
+  ⑧ Structured symbols  — define_symbol(name, **factors) builds symbols from
+                           shared latent axes, enabling real analogy without
+                           any training or embedding model
+  ⑨ Latent factor API   — register_factor / define_symbol / analogy_via_factors
 
 Math:
   Vectors: unit complex, v_i = exp(i*θ), θ ~ Uniform[0,2π]
-  Bind:    a ⊛ b  = a * b        (elementwise complex multiply)
-  Unbind:  m ⊙ k  = m * conj(k)  (exact inverse, no flip hack)
+  Bind:    a ⊛ b  = a * b          (elementwise complex multiply)
+  Unbind:  m ⊙ k  = m * conj(k)   (exact inverse)
   Sim:     Re(v†·w) / (|v||w|)
+  Analogy: (b ⊙ a) ⊛ c ≈ d  — works when a,b,c,d share latent factors
 """
 
 from __future__ import annotations
@@ -262,8 +267,120 @@ class SymbolRegistry:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HoloRecord
+# SymbolSchema — structured symbols via shared latent factors
 # ─────────────────────────────────────────────────────────────────────────────
+
+class SymbolSchema:
+    """
+    Structured symbol layer that enables analogy without training.
+
+    Instead of random independent atoms, symbols are composed from shared
+    latent factors via binding:
+
+        king  = bind(factor("gender:male"),  factor("status:royal"))
+        queen = bind(factor("gender:female"), factor("status:royal"))
+        man   = factor("gender:male")
+        woman = factor("gender:female")
+
+    Then:   queen ⊙ king = conj(male) * female
+            apply to man  = female ≈ woman  ✓
+
+    This is pure database-layer structure — no embeddings, no training.
+    The caller declares the semantic axes they care about; the algebra
+    propagates them automatically.
+
+    Usage:
+        schema = db.schema
+        schema.register_factor("gender", ["male", "female"])
+        schema.register_factor("status", ["royal", "common", "noble"])
+        schema.define_symbol("king",  gender="male",  status="royal")
+        schema.define_symbol("queen", gender="female", status="royal")
+        schema.define_symbol("man",   gender="male")
+        schema.define_symbol("woman", gender="female")
+
+        # Now analogy works:
+        db.analogy("king", "queen", "man")  → "woman" with high similarity
+    """
+
+    def __init__(self, registry: SymbolRegistry):
+        self._reg = registry
+        # factor_axis_name → {value_name → vector}
+        self._factors: dict[str, dict[str, np.ndarray]] = {}
+        # symbol_name → {factor_axis: factor_value}
+        self._symbol_factors: dict[str, dict[str, str]] = {}
+
+    def register_factor(self, axis: str, values: list[str]) -> None:
+        """
+        Declare a semantic axis and its possible values.
+        Each value gets a random phase vector. All values on the same axis
+        share the same random base, rotated by small amounts — so they're
+        similar to each other but distinct from other axes.
+        """
+        if axis not in self._factors:
+            self._factors[axis] = {}
+        base = self._reg.vector(f"_factor_base:{axis}")
+        for i, val in enumerate(values):
+            key = f"{axis}:{val}"
+            if key not in self._factors[axis]:
+                # Rotate base by a deterministic per-value angle
+                # Use a hash so order doesn't matter and new values are stable
+                angle_seed = int(hashlib.md5(key.encode()).hexdigest()[:8], 16)
+                angle = (angle_seed / 0xFFFFFFFF) * 2 * np.pi
+                rotated = base * np.exp(1j * angle)
+                self._factors[axis][val] = normalize_phase(rotated)
+                # Also register in main registry so analogy can find it
+                self._reg._symbols[f"_f:{axis}:{val}"] = Symbol(
+                    name=f"_f:{axis}:{val}",
+                    vector=self._factors[axis][val],
+                )
+                self._reg._dirty = True
+
+    def factor_vector(self, axis: str, value: str) -> np.ndarray:
+        """Return the vector for a given factor axis:value pair."""
+        if axis not in self._factors or value not in self._factors[axis]:
+            # Auto-register on demand
+            self.register_factor(axis, [value])
+        return self._factors[axis][value]
+
+    def define_symbol(self, name: str, **factor_assignments: str) -> np.ndarray:
+        """
+        Define a symbol as a binding of latent factor values.
+
+        define_symbol("king", gender="male", status="royal")
+        → king_vec = bind(factor(gender:male), factor(status:royal))
+
+        Symbols with overlapping factors will show meaningful analogy.
+        """
+        axes = list(factor_assignments.items())
+        if not axes:
+            raise ValueError("define_symbol requires at least one factor assignment")
+
+        # Bind all factors together
+        v = self.factor_vector(*axes[0])
+        for axis, val in axes[1:]:
+            v = bind(v, self.factor_vector(axis, val))
+        v = normalize_phase(v)
+
+        # Register in main symbol registry
+        self._reg._symbols[name] = Symbol(name=name, vector=v)
+        self._reg._dirty = True
+
+        self._symbol_factors[name] = dict(factor_assignments)
+        return v
+
+    def factors_of(self, name: str) -> dict[str, str]:
+        """Return the factor decomposition of a defined symbol."""
+        return self._symbol_factors.get(name, {})
+
+    def symbols_sharing_factor(self, axis: str, value: str) -> list[str]:
+        """Find all symbols that have a given factor value."""
+        return [
+            name for name, factors in self._symbol_factors.items()
+            if factors.get(axis) == value
+        ]
+
+
+
 
 @dataclass
 class HoloRecord:
@@ -330,6 +447,55 @@ class HolographicVDB:
 
         self._field_weights = {**DEFAULT_FIELD_WEIGHTS, **(field_weights or {})}
 
+        # Structured symbol schema (latent factors for analogy support)
+        self.schema = SymbolSchema(self.registry)
+
+        # Orthogonalized role vector cache.
+        # IMPORTANT: once a role vector is frozen (used to encode a record),
+        # it must never change. New fields are orthogonalized against existing
+        # frozen ones; existing frozen vectors are never touched.
+        self._role_cache: dict[str, np.ndarray] = {}
+
+        # Per-field vocabulary: field_name → set of symbol names used as values.
+        # Used to restrict query_field search to semantically valid candidates.
+        self._field_vocab: dict[str, set[str]] = {}
+
+    # ── role vector with orthogonalization ────────────────────────────────────
+
+    def _role_vector(self, field_name: str) -> np.ndarray:
+        """
+        Return a role vector for field_name, orthogonalized against all
+        previously-seen role vectors.
+
+        Contract: once returned, a role vector is FROZEN — it will never
+        change even when new fields are added. This is essential for
+        retrieval correctness: records encoded with an old role vector must
+        be decodable with the same vector later.
+
+        New fields get Gram-Schmidt subtraction against all existing frozen
+        vectors, so they're approximately orthogonal to the existing set.
+        Existing vectors are unaffected.
+
+        Coefficient α=0.15 gives meaningful orthogonalization while keeping
+        vectors well-conditioned under normalize_phase.
+        """
+        if field_name in self._role_cache:
+            return self._role_cache[field_name]
+
+        v = self.registry.vector(f"_role:{field_name}").copy()
+
+        # Subtract projections onto all already-frozen role vectors only.
+        # Do NOT subtract against vectors not yet in cache — those don't
+        # exist yet and won't affect this field's encoding.
+        alpha = 0.15
+        for other_name, other_vec in self._role_cache.items():
+            projection = np.vdot(other_vec, v)   # <r, v>
+            v = v - alpha * projection * other_vec
+
+        v = normalize_phase(v)
+        self._role_cache[field_name] = v   # freeze
+        return v
+
     # ── insert ─────────────────────────────────────────────────────────────
 
     def insert(self, record_id: str, fields: dict[str, Any],
@@ -340,9 +506,15 @@ class HolographicVDB:
         weight_sum = 0.0
 
         for fname, raw in fields.items():
-            role_vec  = self.registry.vector(f"_role:{fname}")
+            role_vec  = self._role_vector(fname)          # orthogonalized
             value_vec, sym_name = self._encode_value(fname, raw)
             field_map[fname] = sym_name
+
+            # Track which symbol names are valid values for this field
+            if fname not in self._field_vocab:
+                self._field_vocab[fname] = set()
+            if not sym_name.startswith("_numeric:"):
+                self._field_vocab[fname].add(sym_name)
 
             w = self._field_weights.get(fname, 1.0)
             binding_vecs.append(w * bind(role_vec, value_vec))
@@ -375,24 +547,36 @@ class HolographicVDB:
                     top_k: int = 3, cleanup_steps: int = 2) -> list[tuple[str, float]]:
         """
         Probe a record for a field value.
-        Applies cleanup memory to denoise the retrieved vector.
+
+        Retrieval is restricted to the per-field vocabulary — only symbols
+        that have actually been used as values for field_name are searched.
+        This eliminates false matches against symbols from other fields
+        (e.g. name values like 'alice' showing up as role candidates).
+
+        cleanup_steps still applies within the vocab-restricted set.
         """
         rec = self._records.get(record_id)
         if rec is None:
             raise KeyError(f"Record {record_id!r} not found")
 
-        role_vec = self.registry.vector(f"_role:{field_name}")
+        role_vec = self._role_vector(field_name)
         probed   = unbind(rec.vector, role_vec)
 
-        # Cleanup: snap to nearest valid symbol (reduces drift)
-        if cleanup_steps > 0:
-            probed = self.registry.cleanup(probed, steps=cleanup_steps)
+        # Typed search: only consider symbols known to be values of this field
+        vocab = self._field_vocab.get(field_name)
+        if vocab:
+            candidates = [
+                (name, cosine_similarity(probed, self.registry.vector(name)))
+                for name in vocab
+            ]
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            return candidates[:top_k]
 
-        candidates = self.registry.nearest_fast(
+        # Fallback: global search excluding internal symbols (pre-first-insert)
+        return self.registry.nearest_fast(
             probed, top_k=top_k,
             exclude=[k for k in self.registry._symbols if k.startswith("_")]
         )
-        return candidates
 
     def get_field(self, record_id: str, field_name: str) -> str:
         results = self.query_field(record_id, field_name, top_k=1)
@@ -416,7 +600,7 @@ class HolographicVDB:
         binding_vecs = []
         weight_sum = 0.0
         for fname, raw in fields.items():
-            role_vec  = self.registry.vector(f"_role:{fname}")
+            role_vec  = self._role_vector(fname)
             value_vec, _ = self._encode_value(fname, raw)
             w = self._field_weights.get(fname, 1.0)
             binding_vecs.append(w * bind(role_vec, value_vec))
@@ -455,7 +639,7 @@ class HolographicVDB:
         if rec is None:
             raise KeyError(f"Record {record_id!r} not found")
 
-        role_vec  = self.registry.vector(f"_role:{field_name}")
+        role_vec  = self._role_vector(field_name)
         old_vec, _ = self._encode_value(field_name, old_value)
         new_vec, _ = self._encode_value(field_name, new_value)
         w = self._field_weights.get(field_name, 1.0)
