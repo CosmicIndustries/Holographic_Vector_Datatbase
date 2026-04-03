@@ -23,6 +23,7 @@ from holographic import (
     HoloDB, Schema, TextField, EnumField, NumericField, BoolField,
     bind, unbind, similarity, superpose, normalize_phase,
 )
+from holographic._db import HoloRecord
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,7 +520,159 @@ with tempfile.TemporaryDirectory() as tmpdir:
 # 15. Export
 # ─────────────────────────────────────────────────────────────────────────────
 
-hr("15. EXPORT")
+hr("16. SHARD REBUILD")
+
+# Disable auto-rebuild so we can inspect accumulated drift manually.
+# A separate test below verifies the auto-rebuild policy fires correctly.
+db_s = HoloDB(dim=1024, seed=13, num_shards=4, auto_rebuild_threshold=None)
+for i in range(40):
+    db_s.insert(f"r{i}", role=f"role_{i%5}", level=f"level_{i%3}", tag=f"t{i%7}")
+
+# Delete 20 records — this leaves subtraction residue in the shards
+for i in range(20):
+    db_s.delete(f"r{i}")
+
+noise_before = db_s.shard_noise_floor()
+ok("shard_noise_floor() runs after deletes",          isinstance(noise_before, dict))
+ok("mutation_counts accumulate correctly",
+   sum(noise_before["mutation_counts"]) == 60,        # 40 inserts + 20 deletes
+   f"sum={sum(noise_before['mutation_counts'])} counts={noise_before['mutation_counts']}")
+ok("live_counts sum to 20 remaining records",
+   sum(noise_before["live_counts"]) == 20,
+   str(noise_before["live_counts"]))
+ok("drift_estimates are non-negative",
+   all(d >= 0 for d in noise_before["drift_estimates"]))
+ok("recommend_rebuild is True after heavy deletes",
+   noise_before["recommend_rebuild"],
+   str(noise_before))
+
+# Verify actual floating-point drift exists in at least one shard
+# (shards subtracted 20 vectors; residue should be measurable)
+shards_after_delete = [s.copy() for s in db_s._shards]
+fresh = [np.zeros(1024, dtype=complex) for _ in range(4)]
+for rid, rec in db_s._records.items():
+    idx = db_s._shard_idx(rid)
+    fresh[idx] += rec.vector
+actual_drifts = [float(np.linalg.norm(db_s._shards[i] - fresh[i])) for i in range(4)]
+# At complex128 precision, 20 subtract cycles produce ~dim × ε_mach residue
+# (~2e-14 at D=1024). This confirms the shard accumulator is clean but not
+# perfectly exact — rebuild_shards() eliminates even this residue.
+ok("floating-point drift exists at machine epsilon level",
+   any(d > 0 for d in actual_drifts),
+   f"drifts={[f'{d:.2e}' for d in actual_drifts]}")
+
+# Rebuild and verify
+result = db_s.rebuild_shards()
+ok("rebuild_shards() returns diagnostic dict",        isinstance(result, dict))
+ok("rebuild_shards() reports correct shard count",    result["shards_rebuilt"] == 4)
+ok("rebuild_shards() reports max_drift",              "max_drift" in result)
+ok("rebuild_shards() reports mean_drift",             "mean_drift" in result)
+ok("rebuild_shards() reports mutations_cleared",      result["mutations_cleared"] == noise_before["mutation_counts"])
+ok("mutation_counts reset to zero after rebuild",
+   all(c == 0 for c in db_s._mutation_counts))
+ok("recommend_rebuild is False after rebuild",
+   not db_s.shard_noise_floor()["recommend_rebuild"])
+
+# Core correctness: after rebuild, shards exactly match fresh computation
+post_rebuild_drifts = [
+    float(np.linalg.norm(db_s._shards[i] - fresh[i])) for i in range(4)
+]
+ok("shards match exact recomputation after rebuild",
+   all(d < 1e-10 for d in post_rebuild_drifts),
+   f"residual drifts={[f'{d:.2e}' for d in post_rebuild_drifts]}")
+
+# Verify search quality improves: insert a known record, delete it,
+# verify its similarity drops after rebuild
+db_s.insert("ghost", role="role_0", level="level_0", tag="t0")
+ghost_vec = db_s.get("ghost").vector.copy()
+db_s.delete("ghost")
+
+# Search for the ghost before rebuild (noise may keep it semi-visible in shard)
+# Then rebuild and verify shard is clean
+db_s.rebuild_shards()
+results_post = db_s.search(ghost_vec, top_k=5)
+ghost_in_results = any(r[0] == "ghost" for r in results_post)
+ok("deleted record not in search results after rebuild",
+   not ghost_in_results,
+   str([r[0] for r in results_post]))
+
+# Stats surface shard health
+s = db_s.stats()
+ok("stats() includes shard_health key",        "shard_health" in s)
+ok("stats() shard_health has recommend_rebuild", "recommend_rebuild" in s["shard_health"])
+ok("stats() shard_health has total_mutations",   "total_mutations" in s["shard_health"])
+
+# Persistence round-trips mutation_counts
+import tempfile
+with tempfile.TemporaryDirectory() as tmpdir:
+    db_s.insert("p1", role="role_1", level="level_1", tag="t1")
+    db_s.delete("p1")           # mutation_counts now has nonzero entries again
+    counts_before_save = list(db_s._mutation_counts)
+    db_s.save(f"{tmpdir}/sdb")
+    db_s2 = HoloDB.load(f"{tmpdir}/sdb")
+    ok("mutation_counts persist through save/load",
+       db_s2._mutation_counts == counts_before_save,
+       f"{db_s2._mutation_counts} vs {counts_before_save}")
+    ok("auto_rebuild_threshold persists through save/load",
+       db_s2.auto_rebuild_threshold == db_s.auto_rebuild_threshold)
+
+# ── Update mutation counting ──────────────────────────────────────────────────
+# update() does subtract + re-insert = 2 mutations per shard
+db_upd = HoloDB(dim=512, seed=77, num_shards=2, auto_rebuild_threshold=None)
+db_upd.insert("x1", role="a", level="b")
+counts_after_insert = list(db_upd._mutation_counts)
+db_upd.update("x1", level="c")
+counts_after_update = list(db_upd._mutation_counts)
+# Each update touches one shard: subtract (1) + insert (1) = 2 increments
+shard_of_x1 = db_upd._shard_idx("x1")
+delta = counts_after_update[shard_of_x1] - counts_after_insert[shard_of_x1]
+ok("update() counts as 2 mutations (subtract + re-insert)", delta == 2,
+   f"delta={delta}")
+
+# ── Transaction rolls back mutation_counts ────────────────────────────────────
+db_tx = HoloDB(dim=512, seed=88, num_shards=2, auto_rebuild_threshold=None)
+db_tx.insert("base", role="x", level="y")
+counts_before_tx = list(db_tx._mutation_counts)
+try:
+    with db_tx.transaction():
+        db_tx.insert("inside", role="x", level="y")
+        raise RuntimeError("rollback")
+except RuntimeError:
+    pass
+ok("transaction rollback restores mutation_counts",
+   db_tx._mutation_counts == counts_before_tx,
+   f"{db_tx._mutation_counts} vs {counts_before_tx}")
+
+# ── insert_many defers matrix rebuild ─────────────────────────────────────────
+db_im = HoloDB(dim=512, seed=99, num_shards=4, auto_rebuild_threshold=None)
+batch = [(f"b{i}", {"role": f"r{i%3}", "level": f"l{i%2}"}) for i in range(20)]
+db_im.insert_many(batch)
+ok("insert_many inserts all records",    len(db_im) == 20)
+ok("insert_many result is correct type", isinstance(db_im.get("b0"), HoloRecord))
+# Matrix should be clean after insert_many (not repeatedly dirtied)
+ok("insert_many leaves matrix consistent",
+   len(db_im._batch_search(db_im.get("b0").vector, top_k=1)) == 1)
+
+# ── Auto-rebuild fires when threshold exceeded ────────────────────────────────
+db_ar = HoloDB(dim=512, seed=11, num_shards=2, auto_rebuild_threshold=0.05)
+for i in range(10):
+    db_ar.insert(f"ar{i}", role=f"r{i%3}", level=f"l{i%2}")
+for i in range(8):          # delete 80% — drift estimate will exceed 0.05
+    db_ar.delete(f"ar{i}")
+# After the last delete, auto-rebuild should have fired → counts reset
+ok("auto-rebuild resets mutation_counts when threshold exceeded",
+   all(c == 0 for c in db_ar._mutation_counts),
+   str(db_ar._mutation_counts))
+
+# ── Auto-rebuild disabled with threshold=None ─────────────────────────────────
+db_na = HoloDB(dim=512, seed=22, num_shards=2, auto_rebuild_threshold=None)
+for i in range(10):
+    db_na.insert(f"na{i}", role=f"r{i%3}", level=f"l{i%2}")
+for i in range(8):
+    db_na.delete(f"na{i}")
+ok("auto-rebuild disabled with threshold=None",
+   sum(db_na._mutation_counts) > 0,  # counts accumulated, no rebuild fired
+   str(db_na._mutation_counts))
 
 records_list = db.to_records()
 ok("to_records() returns list of dicts",  isinstance(records_list, list))

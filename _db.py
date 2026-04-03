@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -97,6 +98,7 @@ class HoloDB:
         num_shards: int = 16,
         schema: Optional[Schema] = None,
         field_weights: dict[str, float] | None = None,
+        auto_rebuild_threshold: float | None = 0.30,
         _skip_init: bool = False,
     ):
         if _skip_init:
@@ -104,6 +106,7 @@ class HoloDB:
             self.dim = dim
             self._num_shards = num_shards
             self.schema_def = schema
+            self.auto_rebuild_threshold = auto_rebuild_threshold
             self.symbols = SymbolRegistry(dim=dim)
             self.numeric = NumericEncoder(dim=dim, registry=self.symbols)
             self.symbols_schema = SymbolSchema(self.symbols)
@@ -112,14 +115,17 @@ class HoloDB:
             self._field_weights: dict[str, float] = {}
             self._field_vocab: dict[str, set[str]] = {}
             self._role_cache: dict[str, np.ndarray] = {}
+            self._mutation_counts: list[int] = [0] * num_shards
             self._rec_matrix: Optional[np.ndarray] = None
             self._rec_ids_ordered: list[str] = []
             self._rec_matrix_dirty = True
+            self._lock = threading.RLock()
             return
 
         self.dim = dim
         self._num_shards = num_shards
         self.schema_def = schema
+        self.auto_rebuild_threshold = auto_rebuild_threshold
 
         self.symbols = SymbolRegistry(dim=dim, seed=seed)
         self.numeric = NumericEncoder(dim=dim, registry=self.symbols)
@@ -147,6 +153,14 @@ class HoloDB:
         self._field_vocab: dict[str, set[str]] = {}
         self._role_cache: dict[str, np.ndarray] = {}
 
+        # Per-shard mutation counter: incremented on every insert, delete,
+        # and update. Used by shard_noise_floor() to estimate drift.
+        self._mutation_counts: list[int] = [0] * num_shards
+
+        # Re-entrant lock — held during all state-mutating operations.
+        # RLock (not Lock) so that internal calls between methods don't deadlock.
+        self._lock = threading.RLock()
+
         # Vectorized record matrix (rebuilt lazily)
         self._rec_matrix: Optional[np.ndarray] = None
         self._rec_ids_ordered: list[str] = []
@@ -164,18 +178,42 @@ class HoloDB:
         """
         if not fields:
             raise ValueError("insert() requires at least one field")
-        if record_id in self._records:
-            raise KeyError(f"Record {record_id!r} already exists. Use update() to modify.")
-
-        # Validate against schema if declared
-        if self.schema_def:
-            fields = self.schema_def.validate(fields)
-
-        return self._encode_and_store(record_id, fields, metadata=_meta or {})
+        with self._lock:
+            if record_id in self._records:
+                raise KeyError(f"Record {record_id!r} already exists. Use update() to modify.")
+            if self.schema_def:
+                fields = self.schema_def.validate(fields)
+            rec = self._encode_and_store(record_id, fields, metadata=_meta or {})
+        self._maybe_auto_rebuild()
+        return rec
 
     def insert_many(self, records: list[tuple[str, dict]]) -> list[HoloRecord]:
-        """Bulk insert. Each item is (record_id, fields_dict)."""
-        return [self.insert(rid, **flds) for rid, flds in records]
+        """
+        Bulk insert. Each item is (record_id, fields_dict).
+
+        More efficient than N sequential insert() calls: the record matrix is
+        rebuilt once at the end rather than being dirtied N times, and
+        auto-rebuild is checked once after the batch rather than after each
+        record. The entire batch is held under one lock acquisition.
+        """
+        if not records:
+            return []
+        with self._lock:
+            _threshold = self.auto_rebuild_threshold
+            self.auto_rebuild_threshold = None
+            results = []
+            try:
+                for rid, flds in records:
+                    if rid in self._records:
+                        raise KeyError(f"Record {rid!r} already exists.")
+                    if self.schema_def:
+                        flds = self.schema_def.validate(flds)
+                    results.append(self._encode_and_store(rid, flds, metadata={}))
+            finally:
+                self.auto_rebuild_threshold = _threshold
+            self._rebuild_record_matrix()
+        self._maybe_auto_rebuild()
+        return results
 
     # ─────────────────────────────────────────────────────────────────────────
     # READ
@@ -254,68 +292,176 @@ class HoloDB:
         Update specific fields of an existing record.
         Unmodified fields are preserved exactly.
         """
-        rec = self._records.get(record_id)
-        if rec is None:
-            raise KeyError(f"Record {record_id!r} not found")
-
-        if self.schema_def:
-            fields = self.schema_def.validate(fields)
-
-        # Merge: start from existing raw values, overlay updates
-        merged = {**rec.raw_values, **fields}
-
-        # Remove old shard contribution
-        shard_idx = self._shard_idx(record_id)
-        self._shards[shard_idx] -= rec.vector
-
-        # Re-encode and store
-        new_rec = self._encode_and_store(
-            record_id, merged,
-            metadata=rec.metadata,
-            _overwrite=True,
-        )
-
+        with self._lock:
+            rec = self._records.get(record_id)
+            if rec is None:
+                raise KeyError(f"Record {record_id!r} not found")
+            if self.schema_def:
+                fields = self.schema_def.validate(fields)
+            merged    = {**rec.raw_values, **fields}
+            shard_idx = self._shard_idx(record_id)
+            self._shards[shard_idx] -= rec.vector
+            self._mutation_counts[shard_idx] += 1
+            new_rec = self._encode_and_store(
+                record_id, merged, metadata=rec.metadata, _overwrite=True,
+            )
+        self._maybe_auto_rebuild()
         return new_rec
 
     def upsert(self, record_id: str, **fields: Any) -> HoloRecord:
         """Insert if not exists, update if exists."""
-        if record_id in self._records:
-            return self.update(record_id, **fields)
-        return self.insert(record_id, **fields)
+        with self._lock:
+            if record_id in self._records:
+                return self.update(record_id, **fields)
+            return self.insert(record_id, **fields)
 
     # ─────────────────────────────────────────────────────────────────────────
     # DELETE
     # ─────────────────────────────────────────────────────────────────────────
 
     def delete(self, record_id: str) -> None:
-        rec = self._records.get(record_id)
-        if rec is None:
-            raise KeyError(f"Record {record_id!r} not found")
-
-        # Remove from shard memory
-        shard_idx = self._shard_idx(record_id)
-        self._shards[shard_idx] -= rec.vector
-
-        del self._records[record_id]
-        self._rec_matrix_dirty = True
+        with self._lock:
+            rec = self._records.get(record_id)
+            if rec is None:
+                raise KeyError(f"Record {record_id!r} not found")
+            shard_idx = self._shard_idx(record_id)
+            self._shards[shard_idx] -= rec.vector
+            self._mutation_counts[shard_idx] += 1
+            del self._records[record_id]
+            self._rec_matrix_dirty = True
+        self._maybe_auto_rebuild()
 
     def delete_many(self, record_ids: list[str]) -> int:
-        """Delete multiple records. Returns count deleted."""
-        count = 0
-        for rid in record_ids:
-            if rid in self._records:
-                self.delete(rid)
-                count += 1
+        """Delete multiple records atomically. Returns count deleted."""
+        with self._lock:
+            count = 0
+            for rid in record_ids:
+                rec = self._records.get(rid)
+                if rec is not None:
+                    shard_idx = self._shard_idx(rid)
+                    self._shards[shard_idx] -= rec.vector
+                    self._mutation_counts[shard_idx] += 1
+                    del self._records[rid]
+                    count += 1
+            if count:
+                self._rec_matrix_dirty = True
+        if count:
+            self._maybe_auto_rebuild()
         return count
 
     def clear(self) -> None:
         """Remove all records (preserves schema and symbol vocab)."""
-        self._records.clear()
-        self._shards = [np.zeros(self.dim, dtype=complex) for _ in range(self._num_shards)]
-        self._rec_matrix = None
-        self._rec_ids_ordered = []
-        self._rec_matrix_dirty = True
-        self._field_vocab.clear()
+        with self._lock:
+            self._records.clear()
+            self._shards          = [np.zeros(self.dim, dtype=complex) for _ in range(self._num_shards)]
+            self._mutation_counts = [0] * self._num_shards
+            self._rec_matrix      = None
+            self._rec_ids_ordered = []
+            self._rec_matrix_dirty = True
+            self._field_vocab.clear()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SHARD MAINTENANCE
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def rebuild_shards(self) -> dict:
+        """
+        Recompute all shard memory vectors from scratch using only live records.
+
+        Why this is necessary
+        ─────────────────────
+        Each shard is an additive superposition of its records' vectors.
+        Delete and update subtract the old vector from the accumulator, but
+        floating-point subtraction on complex accumulators is not exact:
+
+            shard += v    (insert)
+            shard -= v    (delete)
+
+        After many insert/delete cycles, `shard` drifts away from the exact
+        superposition of live records. The residue acts as a noise floor that
+        raises the similarity scores of deleted records and lowers the contrast
+        between live records during shard-guided search.
+
+        rebuild_shards() eliminates this drift by recomputing shards as:
+
+            shard[i] = Σ { H_r : shard_idx(r) == i }
+
+        using only records currently in self._records.
+
+        When to call
+        ────────────
+        The noise floor is proportional to the number of mutations (inserts +
+        deletes + updates) on a shard since last rebuild, relative to the
+        number of live records. A reasonable heuristic:
+
+            rebuild when shard_noise_floor() > threshold  (e.g. 0.05)
+
+        For write-heavy workloads call explicitly after bulk deletes. For
+        read-heavy workloads the noise floor rarely matters — skip it.
+
+        Returns
+        ───────
+        dict with per-shard diagnostics:
+            {
+                "shards_rebuilt": int,
+                "max_drift":      float,   # largest L2 change across shards
+                "mean_drift":     float,
+                "mutations_cleared": list[int],  # mutation count per shard before reset
+            }
+        """
+        with self._lock:
+            old_shards = [s.copy() for s in self._shards]
+            new_shards = [np.zeros(self.dim, dtype=complex) for _ in range(self._num_shards)]
+            for rid, rec in self._records.items():
+                new_shards[self._shard_idx(rid)] += rec.vector
+            drifts = [
+                float(np.linalg.norm(new_shards[i] - old_shards[i]))
+                for i in range(self._num_shards)
+            ]
+            mutations_cleared     = list(self._mutation_counts)
+            self._shards          = new_shards
+            self._mutation_counts = [0] * self._num_shards
+
+        return {
+            "shards_rebuilt":    self._num_shards,
+            "max_drift":         max(drifts),
+            "mean_drift":        sum(drifts) / len(drifts),
+            "mutations_cleared": mutations_cleared,
+        }
+
+    def shard_noise_floor(self) -> dict:
+        """
+        Estimate the noise floor in each shard without rebuilding.
+
+        Returns per-shard diagnostics useful for deciding whether to call
+        rebuild_shards():
+
+            "mutation_counts"   — inserts + deletes + updates since last rebuild
+            "live_counts"       — live records currently in each shard
+            "drift_estimate"    — approximate relative drift: mutations / (live + 1)
+            "recommend_rebuild" — True if any shard's drift_estimate exceeds 0.10
+
+        The drift_estimate is a proxy, not an exact measurement. It reflects
+        how many additive-subtract cycles have accumulated relative to the
+        current signal volume. Above ~0.10 the noise floor is typically
+        noticeable in similarity rankings; above ~0.30 search quality degrades
+        visibly.
+        """
+        live_counts = [0] * self._num_shards
+        for rid in self._records:
+            live_counts[self._shard_idx(rid)] += 1
+
+        drift_estimates = [
+            self._mutation_counts[i] / (live_counts[i] + 1)
+            for i in range(self._num_shards)
+        ]
+
+        return {
+            "mutation_counts":   list(self._mutation_counts),
+            "live_counts":       live_counts,
+            "drift_estimates":   [round(d, 4) for d in drift_estimates],
+            "recommend_rebuild": any(d > 0.10 for d in drift_estimates),
+        }
 
     # ─────────────────────────────────────────────────────────────────────────
     # TRANSACTIONS
@@ -324,33 +470,38 @@ class HoloDB:
     @contextmanager
     def transaction(self):
         """
-        Atomic batch operations. On exception, rolls back all changes made
-        inside the context.
+        Atomic batch operations with rollback on exception.
 
             with db.transaction() as tx:
                 tx.insert("u1", role="engineer")
                 tx.insert("u2", role="designer")
                 # committed only if no exception
 
-        The transaction object is the db itself (all methods available).
-        Rollback restores the record dict and shard state from a snapshot.
-        """
-        snapshot_records = {rid: HoloRecord(
-            id=r.id, vector=r.vector.copy(), fields=dict(r.fields),
-            raw_values=dict(r.raw_values), metadata=dict(r.metadata),
-        ) for rid, r in self._records.items()}
-        snapshot_shards = [s.copy() for s in self._shards]
-        snapshot_vocab  = {k: set(v) for k, v in self._field_vocab.items()}
+        The lock is held for the entire transaction so no other thread can
+        interleave reads or writes. RLock allows the internal insert/update/
+        delete calls to re-enter without deadlocking.
 
-        try:
-            yield self
-        except Exception:
-            # Rollback
-            self._records = snapshot_records
-            self._shards  = snapshot_shards
-            self._field_vocab = snapshot_vocab
-            self._rec_matrix_dirty = True
-            raise
+        Rollback restores records, shards, field vocab, and mutation counters
+        from a snapshot taken at context entry.
+        """
+        with self._lock:
+            snapshot_records      = {rid: HoloRecord(
+                id=r.id, vector=r.vector.copy(), fields=dict(r.fields),
+                raw_values=dict(r.raw_values), metadata=dict(r.metadata),
+            ) for rid, r in self._records.items()}
+            snapshot_shards          = [s.copy() for s in self._shards]
+            snapshot_vocab           = {k: set(v) for k, v in self._field_vocab.items()}
+            snapshot_mutation_counts = list(self._mutation_counts)
+
+            try:
+                yield self
+            except Exception:
+                self._records         = snapshot_records
+                self._shards          = snapshot_shards
+                self._field_vocab     = snapshot_vocab
+                self._mutation_counts = snapshot_mutation_counts
+                self._rec_matrix_dirty = True
+                raise
 
     # ─────────────────────────────────────────────────────────────────────────
     # ANALOGY
@@ -422,6 +573,7 @@ class HoloDB:
 
     def stats(self) -> dict:
         n = len(self._records)
+        noise = self.shard_noise_floor()
         return {
             "records":            n,
             "symbols":            len(self.symbols),
@@ -429,6 +581,11 @@ class HoloDB:
             "shards":             self._num_shards,
             "fields":             list(self._field_vocab.keys()),
             "theoretical_cap":    int(self.dim * 0.15),
+            "shard_health":       {
+                "recommend_rebuild":  noise["recommend_rebuild"],
+                "max_drift_estimate": max(noise["drift_estimates"]),
+                "total_mutations":    sum(noise["mutation_counts"]),
+            },
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -479,6 +636,7 @@ class HoloDB:
 
         shard_idx = self._shard_idx(record_id)
         self._shards[shard_idx] += rec_vec
+        self._mutation_counts[shard_idx] += 1
         self._rec_matrix_dirty = True
 
         return rec
@@ -556,6 +714,26 @@ class HoloDB:
 
     def _weight_for(self, field_name: str) -> float:
         return self._field_weights.get(field_name, 1.0)
+
+    def _maybe_auto_rebuild(self) -> None:
+        """
+        Trigger rebuild_shards() automatically if the noise floor exceeds
+        auto_rebuild_threshold on any shard.
+
+        Called after every insert, update, and delete (and once at the end of
+        insert_many). Set auto_rebuild_threshold=None to disable.
+
+        The check itself is O(num_shards) — just integer comparisons on the
+        mutation and live counts, no vector math.
+        """
+        if self.auto_rebuild_threshold is None:
+            return
+        noise = self.shard_noise_floor()
+        if noise["recommend_rebuild"] or any(
+            d > self.auto_rebuild_threshold
+            for d in noise["drift_estimates"]
+        ):
+            self.rebuild_shards()
 
     def __repr__(self) -> str:
         return (
