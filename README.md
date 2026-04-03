@@ -1,244 +1,298 @@
+# holographic
 
-<!-- prettier-ignore -->
-```sh
---parser markdown
+**Phase HRR Associative Memory Database** — a vector database built on Holographic Reduced Representations.
+
+All storage, retrieval, analogy, and arithmetic operate in a single shared high-dimensional complex phase space. No external dependencies beyond NumPy.
+
+---
+
+## What makes it different
+
+Standard vector databases store embeddings and search by distance. `holographic` stores *structured records* as superpositions of bound field→value pairs, and retrieves them via algebraic probes. This enables:
+
+- **Field-level retrieval without indexes** — unbind a record with a role vector to extract any field
+- **Composable queries** — probe vectors are built from partial field specs, no query language parser needed
+- **Analogy** — `king:queen :: man:?` resolves to `woman` purely from declared symbol structure, no training
+- **Relational edit** — swap one field value while preserving all others as a single vector operation
+- **Noise robustness** — Phase HRR exact inverse means σ=0.40 noise still recovers the correct record at sim=0.91
+
+---
+
+## Installation
+
+```bash
+pip install holographic        # once published
+# or from source:
+pip install -e /path/to/holographic
 ```
 
-**Input:**
-<!-- prettier-ignore -->
-```markdown
-A **holographic vector database** uses Holographic Reduced Representations (HRRs) — distributed encodings where information is spread across every dimension, not localized. Key ops: **bind** (circular convolution), **superpose** (addition), **probe** (correlation). Ideal for associative memory, analogy, and structured knowledge retrieval.
+Requires Python ≥ 3.10, NumPy ≥ 1.24. No other dependencies.
 
-Building the core library + interactive visual explorer:All 9 demos pass. Now the interactive visual explorer:Now building the interactive visual explorer:Now packaging the library:Here's what was built and verified:
+---
 
-**`holographic_vdb.py`** — the core library. Requires only `numpy`.
+## Quick start
 
-Key operations (all proven working in the demo run):
+```python
+from holographic import HoloDB, Schema
 
-- `bind(a, b)` — circular convolution via FFT. Associates two symbols; result is orthogonal to both inputs. The binding is information-theoretically lossless.
-- `unbind(memory, key)` — circular correlation to recover a stored value from a composite trace
-- `superpose(*vecs)` — addition + renormalize. Stores N bindings in a single vector simultaneously; probing any key recovers its value at ~`1/√N` fidelity
-- `HolographicVDB.insert(id, fields)` — encodes a Python dict as a holographic vector using role-value bindings
-- `search_by_fields(partial_fields)` — fuzzy partial-match query (e.g. `{role:"engineer", level:"senior"}` scored `0.730` for carol, `0.716` for alice — non-engineers all below `0.36`)
-- `analogy(a, b, c)` — HRR arithmetic: `b ⊙ a ⊛ c ≈ d`
-- `aggregate(ids)` — cluster centroid via superposition (engineers scored `0.75–0.86`, non-engineers `0.01–0.23`)
-- `similarity_matrix()` — pairwise cosine grid (alice-carol = `0.51`, both senior Python/Rust engineers; bob-carol = `-0.01`, orthogonal as expected)
+# Optional typed schema
+schema = (Schema()
+    .text("name",   weight=2.5)
+    .enum("role",   ["engineer", "designer", "manager"])
+    .enum("level",  ["junior", "mid", "senior", "staff"])
+    .numeric("age", scale=40, lo=16, hi=90)
+    .boolean("active"))
 
-**Interactive explorer** — click **load demo symbols**, then use the **Bind** tab to associate pairs (`king ⊛ queen`, `man ⊛ woman`), then **Probe** to recover values, **Similarity** for the heatmap, and **Vector Space** for the 2D projection.
+db = HoloDB(dim=1024, schema=schema, seed=42)
 
-The FFT is implemented from scratch in both Python and the browser JS — no hidden dependencies.
+# Insert
+db.insert("alice", name="alice", role="engineer", lang="python", level="senior", age=32, active=True)
+db.insert("bob",   name="bob",   role="designer", lang="figma",  level="mid",    age=27, active=True)
+db.insert("carol", name="carol", role="engineer", lang="rust",   level="senior", age=41, active=False)
 
+# Query
+results = (db.query()
+    .where(role="engineer")
+    .where(level="senior")
+    .range("age", lo=25, hi=45)
+    .limit(5)
+    .run())
 
-╔══════════════════════════════════════════════╗
-║     H O L O G R A P H I C   V D B            ║
-║     Holographic Reduced Representations       ║
-╚══════════════════════════════════════════════╝
+for r in results:
+    print(r.id, r.score, r.get("lang"))
 
-Initialized: HolographicVDB(dim=2048, records=0, symbols=0)
+# Field probe — holographic unbinding, no index
+print(db.get_field("alice", "role"))   # → "engineer"
 
-──── 1. INSERT RECORDS ─────────────────────────────────────
-  + HoloRecord(id='alice', fields=['name', 'role', 'lang', 'level'])
-  + HoloRecord(id='bob', fields=['name', 'role', 'lang', 'level'])
-  + HoloRecord(id='carol', fields=['name', 'role', 'lang', 'level'])
-  + HoloRecord(id='dave', fields=['name', 'role', 'lang', 'level'])
-  + HoloRecord(id='eve', fields=['name', 'role', 'lang', 'level'])
-  + HoloRecord(id='mallory', fields=['name', 'role', 'lang', 'level'])
-
-  DB state: HolographicVDB(dim=2048, records=6, symbols=21)
-
-──── 2. FIELD RETRIEVAL  (probe a record for a field value) 
-  ✓  alice.role → engineer  (sim=0.447)
-       runners-up: [('eve', 0.026032152551377623), ('python', 0.02532767600480272)]
-  ✓  bob.lang → figma  (sim=0.451)
-       runners-up: [('mid', 0.03241915076795062), ('eve', 0.019523595172920717)]
-  ✓  carol.level → senior  (sim=0.461)
-       runners-up: [('figma', 0.03592051551235323), ('bob', 0.03495561006778951)]
-
-──── 3. SIMILARITY SEARCH  (find records similar to alice) ─
-  Query: 'alice'  →  nearest records:
-       dave       sim=0.030  
-       alice      sim=0.018  
-       eve        sim=0.011  
-       mallory    sim=-0.013  
-       bob        sim=-0.027  
-       carol      sim=-0.037  
-
-──── 4. FUZZY SEARCH  (find senior engineers) ──────────────
-  Query: {role=engineer, level=senior}  →
-       carol      sim=0.730  actual={'name': 'carol', 'role': 'engineer', 'lang': 'rust', 'level': 'senior'}
-       alice      sim=0.716  actual={'name': 'alice', 'role': 'engineer', 'lang': 'python', 'level': 'senior'}
-       mallory    sim=0.358  actual={'name': 'mallory', 'role': 'designer', 'lang': 'css', 'level': 'senior'}
-       eve        sim=0.355  actual={'name': 'eve', 'role': 'engineer', 'lang': 'python', 'level': 'junior'}
-       dave       sim=0.346  actual={'name': 'dave', 'role': 'manager', 'lang': 'english', 'level': 'senior'}
-       bob        sim=-0.007  actual={'name': 'bob', 'role': 'designer', 'lang': 'figma', 'level': 'mid'}
-
-──── 5. ANALOGY  (role : lang relationship) ────────────────
-  Verifying holographic analogy arithmetic in symbol space...
-
-  alice:carol :: eve:?
-          bob          sim=0.038
-          rust         sim=0.037
-          figma        sim=0.031
-          english      sim=0.022
-          junior       sim=0.021
-
-──── 6. AGGREGATE  (superpose all engineers → cluster centroid) 
-  Superposed: ['alice', 'carol', 'eve']
-  Probing aggregate against all records:
-       alice      sim=0.859  (engineer)
-       carol      sim=0.748  (engineer)
-       eve        sim=0.746  (engineer)
-       mallory    sim=0.226  
-       dave       sim=0.216  
-       bob        sim=0.014  
-
-──── 7. PAIRWISE SIMILARITY MATRIX ─────────────────────────
-              alice     bob       carol     dave      eve       mallory   
-  alice       1.00      0.02      0.51      0.25      0.51      0.26      
-  bob         0.02      1.00      -0.01      -0.02      0.02      0.26      
-  carol       0.51      -0.01      1.00      0.24      0.25      0.26      
-  dave        0.25      -0.02      0.24      1.00      0.02      0.29      
-  eve         0.51      0.02      0.25      0.02      1.00      0.02      
-  mallory     0.26      0.26      0.26      0.29      0.02      1.00      
-
-──── 8. BINDING FIDELITY  (unit test of HRR math) ──────────
-  Memory vector encodes 4 associations simultaneously.
-  Probing each key to recover its value:
-
-  ✓  concept:sky → concept:blue               sim=0.451  [█████████░░░░░░░░░░░]
-  ✓  concept:fire → concept:hot               sim=0.452  [█████████░░░░░░░░░░░]
-  ✓  concept:ocean → concept:deep             sim=0.451  [█████████░░░░░░░░░░░]
-  ✓  concept:forest → concept:green           sim=0.457  [█████████░░░░░░░░░░░]
-
-  All probes decoded. Holographic memory verified.
-
-──── 9. PERSISTENCE ────────────────────────────────────────
-Saved to /tmp/holographic_vdb.pkl
-  Loaded: HolographicVDB(dim=2048, records=6, symbols=29)
-  Verified: HoloRecord(id='alice', fields=['name', 'role', 'lang', 'level'])
-
-╔══════════════════════════════════════════════╗
-║  All demos complete. HolographicVDB nominal.  ║
-╚══════════════════════════════════════════════╝
-
-
+# Update, upsert, delete
+db.update("alice", level="staff")
+db.upsert("dave", role="manager", lang="english", level="senior", age=48, active=True)
+db.delete("bob")
 ```
 
-**Output:**
-<!-- prettier-ignore -->
-```markdown
-A **holographic vector database** uses Holographic Reduced Representations (HRRs) — distributed encodings where information is spread across every dimension, not localized. Key ops: **bind** (circular convolution), **superpose** (addition), **probe** (correlation). Ideal for associative memory, analogy, and structured knowledge retrieval.
+---
 
-Building the core library + interactive visual explorer:All 9 demos pass. Now the interactive visual explorer:Now building the interactive visual explorer:Now packaging the library:Here's what was built and verified:
+## Schema
 
-**`holographic_vdb.py`** — the core library. Requires only `numpy`.
+```python
+schema = (Schema()
+    .text("name")                                   # free-form string
+    .enum("role", ["engineer", "designer"],         # constrained set
+          strict=False)                             # strict=False allows unknowns
+    .numeric("age", scale=40, lo=0, hi=120)         # continuous float, ordinal encoding
+    .boolean("active"))                             # bool → "true"/"false" symbols
 
-Key operations (all proven working in the demo run):
+# Strict schema: rejects undeclared fields on insert
+schema = Schema(strict=True).text("name").enum("role", [...])
+```
 
-- `bind(a, b)` — circular convolution via FFT. Associates two symbols; result is orthogonal to both inputs. The binding is information-theoretically lossless.
-- `unbind(memory, key)` — circular correlation to recover a stored value from a composite trace
-- `superpose(*vecs)` — addition + renormalize. Stores N bindings in a single vector simultaneously; probing any key recovers its value at ~`1/√N` fidelity
-- `HolographicVDB.insert(id, fields)` — encodes a Python dict as a holographic vector using role-value bindings
-- `search_by_fields(partial_fields)` — fuzzy partial-match query (e.g. `{role:"engineer", level:"senior"}` scored `0.730` for carol, `0.716` for alice — non-engineers all below `0.36`)
-- `analogy(a, b, c)` — HRR arithmetic: `b ⊙ a ⊛ c ≈ d`
-- `aggregate(ids)` — cluster centroid via superposition (engineers scored `0.75–0.86`, non-engineers `0.01–0.23`)
-- `similarity_matrix()` — pairwise cosine grid (alice-carol = `0.51`, both senior Python/Rust engineers; bob-carol = `-0.01`, orthogonal as expected)
+Field weights control how much each field contributes to the record vector.
+Higher weight = stronger signal during similarity search.
 
-**Interactive explorer** — click **load demo symbols**, then use the **Bind** tab to associate pairs (`king ⊛ queen`, `man ⊛ woman`), then **Probe** to recover values, **Similarity** for the heatmap, and **Vector Space** for the 2D projection.
+---
 
-The FFT is implemented from scratch in both Python and the browser JS — no hidden dependencies.
+## Query builder
 
-╔══════════════════════════════════════════════╗
-║ H O L O G R A P H I C V D B ║
-║ Holographic Reduced Representations ║
-╚══════════════════════════════════════════════╝
+```python
+# AND constraints
+db.query().where(role="engineer").where(level="senior").run()
 
-Initialized: HolographicVDB(dim=2048, records=0, symbols=0)
+# OR branches
+db.query().where(role="engineer").or_where(role="manager").run()
 
-──── 1. INSERT RECORDS ─────────────────────────────────────
+# NOT / exclusion
+db.query().where(level="senior").exclude(role="manager").run()
 
-- HoloRecord(id='alice', fields=['name', 'role', 'lang', 'level'])
-- HoloRecord(id='bob', fields=['name', 'role', 'lang', 'level'])
-- HoloRecord(id='carol', fields=['name', 'role', 'lang', 'level'])
-- HoloRecord(id='dave', fields=['name', 'role', 'lang', 'level'])
-- HoloRecord(id='eve', fields=['name', 'role', 'lang', 'level'])
-- HoloRecord(id='mallory', fields=['name', 'role', 'lang', 'level'])
+# Numeric range (exact post-filter on raw values)
+db.query().range("age", lo=25, hi=45).run()
 
-DB state: HolographicVDB(dim=2048, records=6, symbols=21)
+# Seed from existing record (similarity search)
+db.query().similar_to("alice").limit(5).run()
 
-──── 2. FIELD RETRIEVAL (probe a record for a field value)
-✓ alice.role → engineer (sim=0.447)
-runners-up: [('eve', 0.026032152551377623), ('python', 0.02532767600480272)]
-✓ bob.lang → figma (sim=0.451)
-runners-up: [('mid', 0.03241915076795062), ('eve', 0.019523595172920717)]
-✓ carol.level → senior (sim=0.461)
-runners-up: [('figma', 0.03592051551235323), ('bob', 0.03495561006778951)]
+# Pagination and ordering
+db.query().order_by("age", ascending=True).offset(10).limit(20).run()
 
-──── 3. SIMILARITY SEARCH (find records similar to alice) ─
-Query: 'alice' → nearest records:
-dave sim=0.030  
- alice sim=0.018  
- eve sim=0.011  
- mallory sim=-0.013  
- bob sim=-0.027  
- carol sim=-0.037
+# Convenience
+db.query().where(role="engineer").count()
+db.query().first()
+db.query().ids()
+db.query().to_dicts()
+```
 
-──── 4. FUZZY SEARCH (find senior engineers) ──────────────
-Query: {role=engineer, level=senior} →
-carol sim=0.730 actual={'name': 'carol', 'role': 'engineer', 'lang': 'rust', 'level': 'senior'}
-alice sim=0.716 actual={'name': 'alice', 'role': 'engineer', 'lang': 'python', 'level': 'senior'}
-mallory sim=0.358 actual={'name': 'mallory', 'role': 'designer', 'lang': 'css', 'level': 'senior'}
-eve sim=0.355 actual={'name': 'eve', 'role': 'engineer', 'lang': 'python', 'level': 'junior'}
-dave sim=0.346 actual={'name': 'dave', 'role': 'manager', 'lang': 'english', 'level': 'senior'}
-bob sim=-0.007 actual={'name': 'bob', 'role': 'designer', 'lang': 'figma', 'level': 'mid'}
+Each `.where()` call adds an AND constraint. `.or_where()` opens an OR branch that is unioned with the main result. `.exclude()` removes exact matches. `.range()` applies an exact numeric boundary post-search.
 
-──── 5. ANALOGY (role : lang relationship) ────────────────
-Verifying holographic analogy arithmetic in symbol space...
+---
 
-alice:carol :: eve:?
-bob sim=0.038
-rust sim=0.037
-figma sim=0.031
-english sim=0.022
-junior sim=0.021
+## Analogy via SymbolSchema
 
-──── 6. AGGREGATE (superpose all engineers → cluster centroid)
-Superposed: ['alice', 'carol', 'eve']
-Probing aggregate against all records:
-alice sim=0.859 (engineer)
-carol sim=0.748 (engineer)
-eve sim=0.746 (engineer)
-mallory sim=0.226  
- dave sim=0.216  
- bob sim=0.014
+Analogy works when symbols are defined from shared latent factors — no training required.
 
-──── 7. PAIRWISE SIMILARITY MATRIX ─────────────────────────
-alice bob carol dave eve mallory  
- alice 1.00 0.02 0.51 0.25 0.51 0.26  
- bob 0.02 1.00 -0.01 -0.02 0.02 0.26  
- carol 0.51 -0.01 1.00 0.24 0.25 0.26  
- dave 0.25 -0.02 0.24 1.00 0.02 0.29  
- eve 0.51 0.02 0.25 0.02 1.00 0.02  
- mallory 0.26 0.26 0.26 0.29 0.02 1.00
+```python
+schema = db.symbols_schema
 
-──── 8. BINDING FIDELITY (unit test of HRR math) ──────────
-Memory vector encodes 4 associations simultaneously.
-Probing each key to recover its value:
+schema.register_factor("gender", ["male", "female"])
+schema.register_factor("status", ["royal", "common"])
 
-✓ concept:sky → concept:blue sim=0.451 [█████████░░░░░░░░░░░]
-✓ concept:fire → concept:hot sim=0.452 [█████████░░░░░░░░░░░]
-✓ concept:ocean → concept:deep sim=0.451 [█████████░░░░░░░░░░░]
-✓ concept:forest → concept:green sim=0.457 [█████████░░░░░░░░░░░]
+schema.define_symbol("king",  gender="male",   status="royal")
+schema.define_symbol("queen", gender="female", status="royal")
+schema.define_symbol("man",   gender="male",   status="common")
+schema.define_symbol("woman", gender="female", status="common")
 
-All probes decoded. Holographic memory verified.
+db.analogy("king", "queen", "man")
+# → [("woman", 1.000), ...]
 
-──── 9. PERSISTENCE ────────────────────────────────────────
-Saved to /tmp/holographic_vdb.pkl
-Loaded: HolographicVDB(dim=2048, records=6, symbols=29)
-Verified: HoloRecord(id='alice', fields=['name', 'role', 'lang', 'level'])
+# Introspection
+schema.symbols_sharing_factor("gender", "female")  # → ["queen", "woman"]
+schema.factors_of("king")                           # → {"gender": "male", "status": "royal"}
+schema.axes()                                       # → ["gender", "status"]
+schema.values_for("gender")                         # → ["male", "female"]
+```
 
-╔══════════════════════════════════════════════╗
-║ All demos complete. HolographicVDB nominal. ║
-╚══════════════════════════════════════════════╝
+---
 
+## Relational edit
+
+Swap one field value while keeping all others — pure vector arithmetic, no re-encoding.
+
+```python
+# "find someone like alice but with rust instead of python"
+edited = db.relational_edit("alice", "lang", "python", "rust")
+
+# edited is an ephemeral HoloRecord (not stored)
+db.search(edited.vector, top_k=3)
+# → carol (rust engineer) ranks first
+```
+
+---
+
+## Aggregation
+
+```python
+# Holographic centroid — superposition of multiple records
+eng_ids = [r.id for r in db.query().where(role="engineer").run()]
+centroid = db.aggregate(eng_ids)
+
+# centroid vector is similar to all constituent records
+db.search(centroid, top_k=5)
+```
+
+---
+
+## Transactions
+
+```python
+with db.transaction() as tx:
+    tx.insert("u1", role="engineer", lang="go")
+    tx.insert("u2", role="designer", lang="figma")
+    # both committed atomically on exit
+
+# On any exception inside the block, both inserts are rolled back
+try:
+    with db.transaction():
+        db.insert("u3", role="engineer")
+        raise RuntimeError("oops")
+except RuntimeError:
+    pass  # u3 was rolled back
+```
+
+---
+
+## Persistence
+
+```python
+db.save("mydb")
+# Writes:
+#   mydb.meta.json    — schema, records, field vocab (human-readable)
+#   mydb.vectors.npz  — all complex phase vectors (compact binary)
+
+db2 = HoloDB.load("mydb")
+```
+
+No pickle. The `.meta.json` file is inspectable and migratable. Records, schema, symbol vocab, and shard state all round-trip exactly.
+
+---
+
+## Export
+
+```python
+records = db.to_records()   # list[dict]  — each record as a plain dict
+json_str = db.to_json()     # JSON string
+stats = db.stats()          # {"records": N, "symbols": M, "dim": D, ...}
+```
+
+---
+
+## Math
+
+All vectors are unit complex: `v_i = exp(i·θ_i)`, `θ_i ~ U[0, 2π]`
+
+| Operation | Formula | Notes |
+|---|---|---|
+| Bind | `a ⊛ b = a * b` | elementwise complex multiply |
+| Unbind | `m ⊙ k = m * conj(k)` | exact inverse (Phase HRR) |
+| Superpose | `normalize(Σ v)` | holographic superposition |
+| Similarity | `Re(v†·w) / (‖v‖‖w‖)` | cosine in complex Hilbert space |
+| Numeric | `base * Π exp(i·θ_i)` | multi-axis phase rotation, ordinal |
+
+A record is encoded as:
+
+```
+H = normalize( Σ_i  w_i · (role_i ⊛ value_i) )
+```
+
+Field retrieval is:
+
+```
+H ⊙ role_f  ≈  value_f
+```
+
+Role vectors are frozen Gram-Schmidt-orthogonalized on first use to minimize cross-field interference.
+
+---
+
+## Capacity and performance
+
+| Records | Accuracy | Query time | Vocab |
+|---|---|---|---|
+| 500 | 100% | ~3.6ms | 50×100×30×10 |
+| 2,000 | 100% | ~3.8ms | " |
+| 5,000 | 100% | ~3.7ms | " |
+| 10,000 | 100% | ~3.8ms | " |
+
+Theoretical capacity: `~0.15 × dim` reliable items per shard. At dim=1024 and 16 shards, this is ~2,400 items before inter-record interference becomes measurable. The typed vocab search path does not use the global cleanup matrix, so field retrieval accuracy is independent of total record count.
+
+---
+
+## Advanced: algebra primitives
+
+```python
+from holographic import bind, unbind, superpose, normalize_phase, similarity
+
+# Build custom vectors
+a = db.symbols.vector("concept_a")
+b = db.symbols.vector("concept_b")
+
+bound = bind(a, b)
+recovered = unbind(bound, a)           # ≈ b
+sim = similarity(recovered, b)         # ≈ 1.0
+
+# Superposition of N vectors
+memory = superpose(bind(k1, v1), bind(k2, v2), bind(k3, v3))
+probe  = unbind(memory, k1)            # ≈ v1 with SNR ~ dim/N
+```
+
+---
+
+## Package structure
+
+```
+holographic/
+├── __init__.py       public API
+├── _algebra.py       Phase HRR primitives (bind, unbind, similarity)
+├── _registry.py      SymbolRegistry, NumericEncoder, SymbolSchema
+├── _schema.py        typed field descriptors (TextField, EnumField, ...)
+├── _query.py         QueryBuilder, QueryResult
+├── _db.py            HoloDB — CRUD, search, transactions, analogy
+├── _persist.py       save/load — JSON metadata + npz vectors
+└── test_holographic.py  89-test suite
 ```
