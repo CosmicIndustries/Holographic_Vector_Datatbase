@@ -690,3 +690,65 @@ Contributors 1
     @CosmicIndustries
     CosmicIndustries C05M1C
 
+
+
+Priority Roadmap
+①⁰ Stress Testing (Immediate)
+High-entropy dataset generation
+Unique identifiers per record
+Track:
+top-1 accuracy
+similarity margin
+degradation curves
+①¹ Symbol Space Structuring
+
+Implement controlled alignment:
+
+Inject field-level latent axes
+Add intra-field similarity bias
+
+Optional:
+
+Contrastive pre-training
+①² Cleanup Memory
+
+Add denoising layer:
+
+kNN-based cleanup
+or attractor-style convergence
+①³ ANN Backend (Scalability)
+
+Add optional index:
+
+approximate nearest neighbor search
+pluggable backend
+①⁴ Role Vector Stability
+Enforce strict orthogonality
+Freeze after initialization
+①⁵ Numeric Encoding Enhancements
+Multi-axis encoding
+improved scaling functions
+boundary handling
+①⁶ Temporal Encoding
+Add sequence binding
+support episodic memory
+①⁷ Multi-Vector Records
+split record representation
+reduce interference
+①⁸ Learned Symbol Geometry (Advanced)
+gradient-based updates
+contrastive learning
+PyTorch integration
+Validation Targets
+Stable retrieval at 10k–50k records
+Meaningful similarity ranking
+Analogy without manual factor definition
+Long-Term Direction
+
+Transition from:
+
+→ algebraic memory system
+
+To:
+
+→ general-purpose cognitive memory substrate
