@@ -302,129 +302,6 @@ The root cause analysis was exactly right — `normalize_phase` after an additiv
 
 On the secondary points: the "perfect accuracy at 1000 records" concern is valid. The current stress test has low symbol entropy (~5 roles × 5 levels × 8 langs = 200 combinations across 1000 records), so cleanup memory essentially never needs to disambiguate — too many records map to the same symbols. A real stress test needs unique or high-cardinality fields per record. When you're ready to push toward the learned alignment path, that's where I'd start: synthetic contrastive pairs to pre-bind semantic structure before inserting operational records.
 
-
-
-
-
-
-
-Skip to content
-
-    CosmicIndustries
-    Holographic_Vector_Datatbase
-
-Repository navigation
-
-    Code
-    Issues
-    Pull requests
-    Actions
-    Projects
-    Wiki
-    Security and quality
-    Insights
-    Settings
-
-Owner avatar
-Holographic_Vector_Datatbase
-Public
-
-CosmicIndustries/Holographic_Vector_Datatbase
-t
-Name	Last commit message
-	Last commit date
-CosmicIndustries
-CosmicIndustries
-Add files via upload
-ef8da16
- · 
-3 days ago
-.github/workflows
-	
-Create python-publish.yml
-	
-3 days ago
-LICENSE
-	
-Initial commit
-	
-5 days ago
-README.md
-	
-Add files via upload
-	
-3 days ago
-__init__.py
-	
-Add files via upload
-	
-4 days ago
-_algebra.py
-	
-Add files via upload
-	
-4 days ago
-_db.py
-	
-Add files via upload
-	
-3 days ago
-_persist.py
-	
-Add files via upload
-	
-4 days ago
-_query.py
-	
-Add files via upload
-	
-4 days ago
-_registry.py
-	
-Add files via upload
-	
-4 days ago
-_schema.py
-	
-Add files via upload
-	
-4 days ago
-demo.py
-	
-Add files via upload
-	
-5 days ago
-demo_v2.py
-	
-Add files via upload
-	
-4 days ago
-docs.md
-	
-Add documentation for Holographic Reduced Representations
-	
-5 days ago
-holographic_vdb.py
-	
-Add files via upload
-	
-5 days ago
-holographic_vdb_v2.py
-	
-Add files via upload
-	
-4 days ago
-pyproject.toml
-	
-Add files via upload
-	
-4 days ago
-test_holographic.py
-	
-Add files via upload
-	
-3 days ago
-todo.md
 	
 Enhance numeric encoding and memory retrieval system
 	
@@ -662,33 +539,100 @@ holographic/
 ├── _db.py            HoloDB — CRUD, search, transactions, analogy
 ├── _persist.py       save/load — JSON metadata + npz vectors
 └── test_holographic.py  89-test suite
+ Roadmap
+①⁰ Stress Testing (Immediate)
 
-About
+    High-entropy dataset generation
 
-Solid project. A **holographic vector database** uses Holographic Reduced Representations (HRRs) — distributed encodings where information is spread across every dimension, not localized. Key ops: **bind** (circular convolution), **superpose** (addition),
-翻译
-Resources
-Readme
-License
-Unlicense license
-Activity
-Stars
-0 stars
-Watchers
-0 watching
-Forks
-0 forks
-Releases 2
-v1.0.1 Latest
-3 days ago
-+ 1 release
-Packages
-No packages published
-Publish your first package
-Contributors 1
+    Unique identifiers per record
 
-    @CosmicIndustries
-    CosmicIndustries C05M1C
+    Track:
+
+        top-1 accuracy
+
+        similarity margin
+
+        degradation curves
+
+①¹ Symbol Space Structuring
+
+Implement controlled alignment:
+
+    Inject field-level latent axes
+
+    Add intra-field similarity bias
+
+Optional:
+
+    Contrastive pre-training
+
+①² Cleanup Memory
+
+Add denoising layer:
+
+    kNN-based cleanup
+
+    or attractor-style convergence
+
+①³ ANN Backend (Scalability)
+
+Add optional index:
+
+    approximate nearest neighbor search
+
+    pluggable backend
+
+①⁴ Role Vector Stability
+
+    Enforce strict orthogonality
+
+    Freeze after initialization
+
+①⁵ Numeric Encoding Enhancements
+
+    Multi-axis encoding
+
+    improved scaling functions
+
+    boundary handling
+
+①⁶ Temporal Encoding
+
+    Add sequence binding
+
+    support episodic memory
+
+①⁷ Multi-Vector Records
+
+    split record representation
+
+    reduce interference
+
+①⁸ Learned Symbol Geometry (Advanced)
+
+    gradient-based updates
+
+    contrastive learning
+
+    PyTorch integration
+
+Validation Targets
+
+    Stable retrieval at 10k–50k records
+
+    Meaningful similarity ranking
+
+    Analogy without manual factor definition
+
+Long-Term Direction
+
+Transition from:
+
+→ algebraic memory system
+
+To:
+
+→ general-purpose cognitive memory substrate
 
 
 
